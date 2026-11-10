@@ -345,5 +345,16 @@ class CommandLineTests(unittest.TestCase):
         )
 
 
+class StatusFormatTests(unittest.TestCase):
+    def test_small_memory_totals_keep_a_decimal(self):
+        # Two fresh relays (about 1.2 MB each) used to print as "0 MB".
+        from mcp_stdio_mux.cli import megabytes
+
+        self.assertEqual(megabytes(0), "0 MB")
+        self.assertEqual(megabytes(1200), "1.2 MB")
+        self.assertEqual(megabytes(2400), "2.3 MB")
+        self.assertEqual(megabytes(400 * 1024), "400 MB")
+
+
 if __name__ == "__main__":
     unittest.main()

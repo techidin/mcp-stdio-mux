@@ -163,16 +163,23 @@ def _print_backends() -> None:
         group_rss[group] += rss
     print(f"{'SERVER':<24}{'DOMAIN':<12}{'SCOPE':<11}{'SESSIONS':>9}{'MEMORY':>10}")
     for data in sorted(backends, key=lambda item: item["server"]):
-        memory = group_rss.get(data.get("backend_pid"), 0) // 1024
+        memory = megabytes(group_rss.get(data.get("backend_pid"), 0))
         print(
             f"{data['server'][:23]:<24}{data['domain'][:11]:<12}{data['scope']:<11}"
-            f"{data['clients']:>9}{memory:>7} MB"
+            f"{data['clients']:>9}{memory:>10}"
         )
     relays = [rss for _, _, rss, args in table if args.startswith(RELAY_PREFIX)]
     print(
-        f"{len(relays)} session relays use {sum(relays) // 1024} MB in total "
+        f"{len(relays)} session relays use {megabytes(sum(relays))} in total "
         "(resident memory, as reported by ps)."
     )
+
+
+def megabytes(kilobytes: int) -> str:
+    """Whole megabytes, with one decimal below 10 MB so small totals are not 0."""
+    if kilobytes == 0 or kilobytes >= 10 * 1024:
+        return f"{kilobytes // 1024} MB"
+    return f"{kilobytes / 1024:.1f} MB"
 
 
 def _process_table() -> list[tuple[int, int, int, str]]:
