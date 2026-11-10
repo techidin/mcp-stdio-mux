@@ -34,7 +34,9 @@ from mcp_stdio_mux.clients import (
 from mcp_stdio_mux.config import Config, load_config
 
 SKILL_NAME = "mcp-stdio-mux"
-EPHEMERAL_MARKERS = ("/.cache/", "/Caches/", "/pipx/.cache/")
+# Where uvx and `pipx run` keep their throwaway environments. uv's own
+# "archive-v0" survives a moved cache (UV_CACHE_DIR, XDG_CACHE_HOME).
+EPHEMERAL_MARKERS = ("/.cache/", "/Caches/", "/pipx/.cache/", "/archive-v0/")
 
 
 @dataclass(frozen=True)
