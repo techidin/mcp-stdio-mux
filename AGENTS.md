@@ -25,4 +25,8 @@ Rules for people and coding agents changing this repository.
 
 - Conventional Commits in English.
 - Branch from `sandbox`; open pull requests against `sandbox`. Only the owner
-  merges to `main` and publishes releases.
+  merges to `main`, with a merge commit so `main` and `sandbox` keep one history.
+- A merge to `main` is a release: `release.yml` publishes to PyPI when
+  `__version__` is new, then tags it and opens a GitHub release from
+  `CHANGELOG.md`. To release, bump `__version__` and add the changelog section
+  in the pull request to `sandbox`; never push version tags by hand.
