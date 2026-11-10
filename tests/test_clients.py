@@ -145,12 +145,9 @@ class CommandTests(unittest.TestCase):
             [
                 EXE,
                 "run",
-                "--domain",
-                "work",
-                "--server",
-                "github",
-                "--env-keys",
-                "TOKEN",
+                "--domain=work",
+                "--server=github",
+                "--env-keys=TOKEN",
                 "--",
                 "npx",
                 "-y",
@@ -176,18 +173,19 @@ class CommandTests(unittest.TestCase):
         server = Server("mcpServers", "docs", ["docs-mcp"], (), "/srv/docs")
 
         self.assertEqual(
-            wrap_command(EXE, "default", server, CONFIG)[:8],
-            [
-                EXE,
-                "run",
-                "--domain",
-                "default",
-                "--server",
-                "docs",
-                "--workspace",
-                "/srv/docs",
-            ],
+            wrap_command(EXE, "default", server, CONFIG)[:5],
+            [EXE, "run", "--domain=default", "--server=docs", "--workspace=/srv/docs"],
         )
+
+    def test_server_names_starting_with_a_dash_survive_parsing(self):
+        from mcp_stdio_mux.clients import Server
+        from mcp_stdio_mux.runtime import parse_run_args
+
+        server = Server("mcpServers", "-odd", ["odd-mcp"], (), None)
+        arguments = parse_run_args(wrap_command(EXE, "-dom", server, CONFIG)[2:])
+
+        self.assertEqual((arguments.server, arguments.domain), ("-odd", "-dom"))
+        self.assertEqual(arguments.command, ["odd-mcp"])
 
 
 class JsonEditTests(unittest.TestCase):
@@ -220,12 +218,9 @@ class JsonEditTests(unittest.TestCase):
             github["args"],
             [
                 "run",
-                "--domain",
-                "default",
-                "--server",
-                "github",
-                "--env-keys",
-                "GITHUB_TOKEN",
+                "--domain=default",
+                "--server=github",
+                "--env-keys=GITHUB_TOKEN",
                 "--",
                 "npx",
                 "-y",
@@ -287,6 +282,33 @@ class JsonEditTests(unittest.TestCase):
         )
         self.assertEqual(document["projects"]["/other"], {"allowedTools": []})
 
+    def test_project_servers_run_in_their_project_directory(self):
+        project = {"mcpServers": {"local": {"command": "node", "args": ["x.js"]}}}
+        pinned = {"mcpServers": {"pin": {"command": "p", "cwd": "/elsewhere"}}}
+        text = json.dumps({"projects": {"/repo": project, "/other": pinned}})
+
+        document = json.loads(edit(self.config("claude-code"), text, wrapper()).text)
+
+        local = document["projects"]["/repo"]["mcpServers"]["local"]["args"]
+        pin = document["projects"]["/other"]["mcpServers"]["pin"]["args"]
+        self.assertIn("--workspace=/repo", local)
+        self.assertIn("--workspace=/elsewhere", pin)
+
+    def test_lone_surrogates_are_written_as_escapes(self):
+        text = '{"history": "\\ud83d", "mcpServers": {"a": {"command": "a"}}}'
+
+        result = edit(self.config("claude-code"), text, wrapper())
+
+        result.text.encode("utf-8")  # must not raise
+        self.assertEqual(json.loads(result.text)["history"], "\ud83d")
+
+    def test_crlf_json_keeps_crlf(self):
+        text = '{\r\n  "mcpServers": {"a": {"command": "a"}}\r\n}\r\n'
+
+        result = edit(self.config(), text, wrapper())
+
+        self.assertNotIn("\n", result.text.replace("\r\n", ""))
+
     def test_claude_code_http_type_is_remote(self):
         text = json.dumps({"mcpServers": {"h": {"type": "http", "command": "x"}}})
 
@@ -324,7 +346,7 @@ class JsonEditTests(unittest.TestCase):
         local = json.loads(result.text)["mcp"]["local"]
 
         self.assertEqual(local["command"][:2], [EXE, "run"])
-        self.assertIn("KEY", local["command"])
+        self.assertIn("--env-keys=KEY", local["command"])
         self.assertEqual(local["command"][-3:], ["--", "bunx", "server"])
         self.assertEqual([r.status for r in result.results], ["changed", "remote"])
 
@@ -365,21 +387,18 @@ class CodexEditTests(unittest.TestCase):
         github = document["mcp_servers"]["github"]
         self.assertEqual(github["command"], EXE)
         self.assertEqual(
-            github["args"][:8],
+            github["args"][:5],
             [
                 "run",
-                "--domain",
-                "default",
-                "--server",
-                "github",
-                "--env-keys",
-                "GITHUB_HOST,GITHUB_TOKEN",
+                "--domain=default",
+                "--server=github",
+                "--env-keys=GITHUB_HOST,GITHUB_TOKEN",
                 "--",
             ],
         )
         self.assertEqual(github["env"], {"GITHUB_HOST": "github.com"})
         docs = document["mcp_servers"]["docs-server"]
-        self.assertIn("--workspace", docs["args"])
+        self.assertIn("--workspace=/srv/docs", docs["args"])
         self.assertEqual(docs["args"][-2:], ["--", "docs-mcp"])
         self.assertEqual(document["profiles"], {"fast": {"model": "gpt-5-mini"}})
         self.assertIn("# Codex settings", result.text)
@@ -398,6 +417,28 @@ class CodexEditTests(unittest.TestCase):
         import tomllib
 
         self.assertEqual(tomllib.loads(undone.text), tomllib.loads(CODEX))
+
+    def test_astral_characters_in_args_round_trip(self):
+        import tomllib
+
+        text = '[mcp_servers.emoji]\ncommand = "e"\nargs = ["pkg-\U0001f600"]\n'
+
+        result = edit(self.config, text, wrapper())
+
+        args = tomllib.loads(result.text)["mcp_servers"]["emoji"]["args"]
+        self.assertEqual(args[-1], "pkg-\U0001f600")
+
+    def test_crlf_toml_keeps_crlf_and_round_trips(self):
+        import tomllib
+
+        text = CODEX.replace("\n", "\r\n")
+
+        result = edit(self.config, text, wrapper())
+
+        self.assertTrue(result.changed)
+        self.assertNotIn("\n", result.text.replace("\r\n", ""))
+        undone = edit(self.config, result.text, unwrapper)
+        self.assertEqual(tomllib.loads(undone.text), tomllib.loads(text))
 
     def test_multi_line_args_are_reported_and_left_untouched(self):
         text = '[mcp_servers.multi]\ncommand = "m"\nargs = [\n  "--a",\n]\n'

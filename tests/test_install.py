@@ -75,7 +75,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual([p.written for p in applied], [True, True, True])
         server = json.loads(self.claude.read_text())["mcpServers"]["github"]
         self.assertEqual(server["command"], EXE)
-        self.assertIn("--domain", server["args"])
+        self.assertIn("--domain=default", server["args"])
         self.assertEqual(
             tomllib.loads(self.codex.read_text())["mcp_servers"]["tilth"]["command"],
             EXE,
@@ -136,7 +136,7 @@ class InstallTests(unittest.TestCase):
         apply(context)
 
         args = json.loads(self.work.read_text())["mcpServers"]["github"]["args"]
-        self.assertEqual(args[args.index("--domain") + 1], "default")
+        self.assertIn("--domain=default", args)
 
     def test_a_broken_file_is_reported_and_the_rest_still_applies(self):
         self.write(".cursor/mcp.json", "{ not json")
@@ -176,6 +176,70 @@ class InstallTests(unittest.TestCase):
         undo(self.context)
         self.assertFalse((shared / "mcp-stdio-mux").exists())
 
+    def test_undo_finds_profiles_set_up_from_another_environment(self):
+        elsewhere = self.write("elsewhere/claude-x/.claude.json", json.dumps(CLAUDE))
+        original = elsewhere.read_bytes()
+        with_dir = {**self.environ, "CLAUDE_CONFIG_DIR": str(elsewhere.parent)}
+        apply(Context(self.home, with_dir, EXE, "darwin"))
+        self.assertIn(EXE, elsewhere.read_text())
+
+        undo(self.context)  # a plain shell: CLAUDE_CONFIG_DIR is not set
+
+        self.assertEqual(elsewhere.read_bytes(), original)
+
+    def test_undo_with_a_missing_backup_unwraps_and_carries_on(self):
+        apply(self.context)
+        install_skills(plan(self.context), "---\nname: mcp-stdio-mux\n---\n")
+        record = next(r for r in self.history() if r["path"] == str(self.claude))
+        Path(record["backup"]).unlink()
+
+        undone = dict((config.path, how) for config, how in undo(self.context))
+
+        self.assertEqual(undone[self.claude], "unwrapped")
+        self.assertEqual(json.loads(self.claude.read_text()), CLAUDE)
+        self.assertEqual(self.codex.read_bytes(), self.originals[self.codex])
+        self.assertFalse((self.home / ".codex/skills/mcp-stdio-mux").exists())
+
+    def test_group_permissions_survive_the_umask(self):
+        os.chmod(self.claude, 0o664)
+        previous = os.umask(0o022)
+        try:
+            apply(self.context)
+        finally:
+            os.umask(previous)
+
+        self.assertEqual(stat.S_IMODE(self.claude.stat().st_mode), 0o664)
+
+    def test_crlf_file_comes_back_byte_exact(self):
+        self.codex.write_bytes(CODEX.replace("\n", "\r\n").encode())
+        original = self.codex.read_bytes()
+
+        apply(self.context)
+        self.assertIn(b"\r\n", self.codex.read_bytes())
+        undo(self.context)
+
+        self.assertEqual(self.codex.read_bytes(), original)
+
+    def test_a_file_changed_after_planning_is_left_alone(self):
+        from mcp_stdio_mux import install
+        from mcp_stdio_mux.clients import ConfigFile
+
+        codex = ConfigFile("Codex", "default", self.codex, "codex", None)
+        with self.assertRaises(OSError):
+            install._write(self.context, codex, b"new", expected=b"what setup read")
+        self.assertEqual(self.codex.read_bytes(), self.originals[self.codex])
+
+    def test_a_file_with_lone_surrogates_is_still_shared(self):
+        cursor = self.write(
+            ".cursor/mcp.json",
+            '{"note": "\\ud83d", "mcpServers": {"a": {"command": "a"}}}',
+        )
+
+        applied = apply(self.context)
+
+        self.assertEqual([p.error for p in applied if p.error], [])
+        self.assertIn(EXE, cursor.read_text())
+
 
 class FindExecutableTests(unittest.TestCase):
     def test_ephemeral_runner_paths_are_skipped(self):
@@ -196,6 +260,18 @@ class FindExecutableTests(unittest.TestCase):
             self.assertIsNone(
                 find_executable({"PATH": str(root / ".cache/uv/archive-v0/abc/bin")})
             )
+
+    def test_relative_path_entries_never_supply_the_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "mcp-stdio-mux"
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                self.assertIsNone(find_executable({"PATH": ":.:bin"}))
+            finally:
+                os.chdir(previous)
 
 
 class CommandLineTests(unittest.TestCase):

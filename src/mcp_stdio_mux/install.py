@@ -1,8 +1,9 @@
 """Setup and undo: rewrite every detected config safely, and put it all back.
 
-Safety rules: re-read each file right before writing it, back up its bytes,
-write atomically through symlinks with the same permissions, re-read to
-confirm, and record what was written so `undo` can restore exact bytes.
+Safety rules: work on bytes (line endings survive), refuse to write a file that
+changed since it was read, back up its bytes, write atomically through symlinks
+with the exact permissions, read it back, and record what was written so `undo`
+can restore exact bytes, even for a profile it can no longer detect.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
@@ -24,7 +25,6 @@ from mcp_stdio_mux import __version__
 from mcp_stdio_mux.clients import (
     ConfigFile,
     Edit,
-    EditError,
     Server,
     detect,
     edit,
@@ -54,10 +54,10 @@ class Context:
 class Planned:
     config: ConfigFile
     domain: str
+    original: bytes = b""
     edit: Edit | None = None
     error: str | None = None
     written: bool = False
-    notes: list[str] = field(default_factory=list)
 
     @property
     def changes(self) -> int:
@@ -71,10 +71,10 @@ def plan(context: Context) -> list[Planned]:
     for found in detect(context.home, context.environ, context.platform):
         item = Planned(found, config.domain(found.profile))
         try:
-            item.edit = edit(
-                found, found.path.read_text(), _wrapper(context, config, item)
-            )
-        except (OSError, UnicodeDecodeError, EditError) as error:
+            item.original = found.path.read_bytes()
+            text = item.original.decode("utf-8")
+            item.edit = edit(found, text, _wrapper(context, config, item))
+        except (OSError, ValueError) as error:  # ValueError: decode, JSON, TOML
             item.error = str(error)
         planned.append(item)
     return planned
@@ -85,38 +85,72 @@ def apply(context: Context) -> list[Planned]:
     for item in planned:
         if item.edit and item.edit.changed:
             try:
-                _write(context, item.config.path, item.edit.text)
+                data = item.edit.text.encode("utf-8")
+                _write(context, item.config, data, expected=item.original)
                 item.written = True
-            except OSError as error:
+            except (OSError, ValueError) as error:
                 item.error = str(error)
     return planned
 
 
 def undo(context: Context) -> list[tuple[ConfigFile, str]]:
-    """Restore exact bytes where nothing touched the file since; unwrap otherwise."""
-    latest = {Path(r["path"]): r for r in _history(context)}
+    """Restore exact bytes where nothing touched the file since; unwrap otherwise.
+
+    Walks every file setup ever wrote as well as every file detected now, so a
+    profile set up from a shell with CLAUDE_CONFIG_DIR is found from any shell.
+    """
+    records = _history(context)
+    latest = {record["path"]: record for record in records}
     undone = []
-    for found in detect(context.home, context.environ, context.platform):
-        target = found.path.resolve()
-        record = latest.get(target)
-        current = target.read_text()
-        how = None
-        if record and _digest(current.encode()) == record["written"]:
-            current = Path(record["backup"]).read_text()
-            _write(context, found.path, current, record_history=False)
-            how = "restored"
+    for found in _undo_candidates(context, records):
         try:
-            unwrapped = edit(found, current, lambda s: unwrap_command(s.command))
-        except EditError:
-            unwrapped = None
-        if unwrapped and unwrapped.changed:
-            # Not recorded: a later undo must never "restore" wrapped bytes.
-            _write(context, found.path, unwrapped.text, record_history=False)
-            how = "unwrapped"
+            how = _undo_file(context, found, latest.get(str(found.path.resolve())))
+        except (OSError, ValueError) as error:
+            how = f"failed: {error}"
         if how:
             undone.append((found, how))
     remove_skills(context)
     return undone
+
+
+def _undo_file(context: Context, found: ConfigFile, record: dict | None) -> str:
+    current = found.path.read_bytes()
+    how = ""
+    if record and _digest(current) == record["written"]:
+        backup = Path(record["backup"])
+        if backup.is_file():
+            original = backup.read_bytes()
+            _write(context, found, original, expected=current, record=False)
+            current, how = original, "restored"
+    unwrapped = edit(
+        found, current.decode("utf-8"), lambda s: unwrap_command(s.command)
+    )
+    if unwrapped.changed:
+        # Not recorded: a later undo must never "restore" wrapped bytes.
+        data = unwrapped.text.encode("utf-8")
+        _write(context, found, data, expected=current, record=False)
+        how = "unwrapped"
+    return how
+
+
+def _undo_candidates(context: Context, records: list[dict]) -> list[ConfigFile]:
+    found = detect(context.home, context.environ, context.platform)
+    seen = {config.path.resolve() for config in found}
+    for record in records:
+        path = Path(record["path"])
+        if path not in seen and path.is_file() and record.get("kind"):
+            seen.add(path)
+            skills = Path(record["skills"]) if record.get("skills") else None
+            found.append(
+                ConfigFile(
+                    record.get("app", "?"),
+                    record.get("profile", "?"),
+                    path,
+                    record["kind"],
+                    skills,
+                )
+            )
+    return found
 
 
 def install_skills(planned: list[Planned], text: str) -> list[Path]:
@@ -138,11 +172,15 @@ def install_skills(planned: list[Planned], text: str) -> list[Path]:
 
 
 def remove_skills(context: Context) -> list[Path]:
+    folders = {
+        config.skills.resolve() / SKILL_NAME
+        for config in _undo_candidates(context, _history(context))
+        if config.skills
+    }
     removed = []
-    for found in detect(context.home, context.environ, context.platform):
-        folder = found.skills.resolve() / SKILL_NAME if found.skills else None
-        skill = folder / "SKILL.md" if folder else None
-        if skill and skill.is_file() and f"name: {SKILL_NAME}" in skill.read_text():
+    for folder in sorted(folders):
+        skill = folder / "SKILL.md"
+        if skill.is_file() and f"name: {SKILL_NAME}" in skill.read_text():
             skill.unlink()
             if not any(folder.iterdir()):
                 folder.rmdir()
@@ -161,13 +199,15 @@ def skill_text() -> str:
 def find_executable(environ: Mapping[str, str]) -> str | None:
     """A stable `mcp-stdio-mux` on PATH; uvx and pipx-run copies are temporary."""
     for entry in environ.get("PATH", "").split(os.pathsep):
+        if not os.path.isabs(entry):
+            continue  # "" and "." mean the current directory: never trust it
         candidate = Path(entry) / "mcp-stdio-mux"
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             continue
         real = candidate.resolve().as_posix()
         if any(marker in real for marker in EPHEMERAL_MARKERS):
             continue
-        return str(candidate.absolute())
+        return str(candidate)
     return None
 
 
@@ -219,46 +259,56 @@ def _wrapper(context: Context, config: Config, item: Planned):
 
 
 def _write(
-    context: Context, path: Path, text: str, record_history: bool = True
+    context: Context,
+    config: ConfigFile,
+    data: bytes,
+    expected: bytes,
+    record: bool = True,
 ) -> None:
-    target = path.resolve()  # write through a symlink, never replace it
+    target = config.path.resolve()  # write through a symlink, never replace it
     before = target.read_bytes()
+    if before != expected:
+        raise OSError(f"{target} changed since it was read; run the command again")
     mode = stat.S_IMODE(target.stat().st_mode)
-    backup = _backup(context, target, before, mode)
+    backup = _backup(context, target, before)
     temporary = target.with_name(f".{target.name}.mcp-stdio-mux-{os.getpid()}")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(descriptor, "w") as handle:
-            handle.write(text)
+        os.fchmod(descriptor, mode)  # exact mode: os.open's would pass the umask
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
     finally:
         if temporary.exists():
             temporary.unlink()
-    written = target.read_bytes()
-    if written != text.encode():
-        raise OSError(f"{target} changed while it was being written; run setup again")
-    if record_history:
+    if target.read_bytes() != data:
+        raise OSError(f"{target} changed while it was being written; run it again")
+    if record:
         records = _history(context)
         records.append(
             {
                 "path": str(target),
                 "backup": str(backup),
-                "written": _digest(written),
+                "written": _digest(data),
                 "time": time.time(),
+                "app": config.app,
+                "profile": config.profile,
+                "kind": config.kind,
+                "skills": str(config.skills) if config.skills else None,
             }
         )
         _state_file(context, "history.json").write_text(json.dumps(records, indent=2))
 
 
-def _backup(context: Context, target: Path, content: bytes, mode: int) -> Path:
-    stamp = time.strftime("%Y%m%dT%H%M%S")
-    folder = context.state_dir / "backups" / stamp
+def _backup(context: Context, target: Path, content: bytes) -> Path:
+    folder = context.state_dir / "backups" / time.strftime("%Y%m%dT%H%M%S")
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-    name = _digest(str(target).encode())[:8] + "-" + target.name.lstrip(".")
-    backup = folder / name
-    descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode & 0o600)
+    # Unique per write: setup and undo within one second must not collide.
+    name = f"{_digest(str(target).encode())[:8]}-{time.time_ns()}-{target.name}"
+    backup = folder / name.replace("-.", "-")
+    descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(content)
     return backup

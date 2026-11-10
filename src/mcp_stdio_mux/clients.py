@@ -137,11 +137,12 @@ def wrap_command(exe: str, domain: str, server: Server, config: Config) -> list[
     original = unwrap_command(server.command)
     if config.scope(original, server.name) == "native":
         return original
-    wrapped = [exe, "run", "--domain", domain, "--server", server.name]
+    # --option=value, so a name that starts with "-" is not read as a flag.
+    wrapped = [exe, "run", f"--domain={domain}", f"--server={server.name}"]
     if server.cwd:
-        wrapped += ["--workspace", server.cwd]
+        wrapped.append(f"--workspace={server.cwd}")
     if server.env_keys:
-        wrapped += ["--env-keys", ",".join(sorted(server.env_keys))]
+        wrapped.append("--env-keys=" + ",".join(sorted(server.env_keys)))
     return [*wrapped, "--", *original]
 
 
@@ -171,30 +172,44 @@ def edit(config: ConfigFile, text: str, transform: Transform) -> Edit:
     if not isinstance(document, dict):
         raise EditError(f"{config.path} does not hold a JSON object")
     results = [
-        _edit_json_server(config.kind, location, name, server, transform)
-        for location, servers in _json_server_tables(config.kind, document)
+        _edit_json_server(config.kind, location, name, server, transform, home)
+        for location, servers, home in _json_server_tables(config.kind, document)
         for name, server in servers.items()
     ]
     if not any(result.status == "changed" for result in results):
         return Edit(text, results)
     rendered = json.dumps(document, indent=2, ensure_ascii=False)
-    return Edit(rendered + ("\n" if text.endswith("\n") else ""), results)
+    try:
+        rendered.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate can only be kept escaped
+        rendered = json.dumps(document, indent=2)
+    rendered += "\n" if text.endswith("\n") else ""
+    if "\r\n" in text:
+        rendered = rendered.replace("\n", "\r\n")  # JSON strings hold no raw \n
+    return Edit(rendered, results)
 
 
 def _json_server_tables(
     kind: str, document: MutableMapping[str, object]
-) -> Iterator[tuple[str, MutableMapping[str, object]]]:
+) -> Iterator[tuple[str, MutableMapping[str, object], str | None]]:
+    """Each server table with the directory its servers start in, if fixed."""
     key = "mcp" if kind == "opencode" else "mcpServers"
     if isinstance(document.get(key), dict):
-        yield key, document[key]
+        yield key, document[key], None
     projects = document.get("projects") if kind == "claude-code" else None
     for project, settings in (projects or {}).items():
         if isinstance(settings, dict) and isinstance(settings.get("mcpServers"), dict):
-            yield f"projects[{project}]", settings["mcpServers"]
+            # Claude Code starts a project's own servers in that project.
+            yield f"projects[{project}]", settings["mcpServers"], project
 
 
 def _edit_json_server(
-    kind: str, location: str, name: str, server: object, transform: Transform
+    kind: str,
+    location: str,
+    name: str,
+    server: object,
+    transform: Transform,
+    home: str | None,
 ) -> Result:
     def result(status: str, command: list[str] | None = None) -> Result:
         return Result(location, name, status, command or [])
@@ -217,7 +232,7 @@ def _edit_json_server(
         env = server.get("env", {})
     if not _is_command(command):
         return result("unsupported: command is not a list of strings")
-    cwd = server.get("cwd") if isinstance(server.get("cwd"), str) else None
+    cwd = server.get("cwd") if isinstance(server.get("cwd"), str) else home
     current = list(command)
     new = transform(Server(location, name, current, _keys(env), cwd))
     if new == current:
@@ -233,7 +248,8 @@ def _edit_json_server(
 
 
 _SERVER_HEADER = re.compile(
-    r'^\[mcp_servers\.(?:"([^"\\]+)"|([A-Za-z0-9_-]+))\][ \t]*(?:#.*)?$', re.M
+    r'^\[mcp_servers\.(?:"([^"\\]+)"|([A-Za-z0-9_-]+))\][ \t]*(?:#[^\r\n]*)?\r?$',
+    re.M,
 )
 _ANY_HEADER = re.compile(r"^[ \t]*\[", re.M)
 
@@ -266,7 +282,11 @@ def _edit_codex(text: str, transform: Transform) -> Edit:
     new_text = text
     for start, end, section in sorted(replacements, reverse=True):
         new_text = new_text[:start] + section + new_text[end:]
-    if tomllib.loads(new_text) != expected:
+    try:
+        round_trip = tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError:
+        round_trip = None
+    if round_trip != expected:
         raise EditError("config.toml rewrite did not round-trip; nothing written")
     return Edit(new_text, results)
 
@@ -304,25 +324,31 @@ def _plan_codex_server(
     new = transform(Server("mcp_servers", name, command, _keys(env_keys), cwd))
     if new == command:
         return result("unchanged", command), None
-    section = _replace_line(section, command_line, "command", json.dumps(new[0]))
-    args = json.dumps(new[1:])
+    # ensure_ascii=False: TOML has no surrogate-pair escapes for emoji.
+    section = _replace_line(
+        section, command_line, "command", json.dumps(new[0], ensure_ascii=False)
+    )
+    args = json.dumps(new[1:], ensure_ascii=False)
+    newline = "\r\n" if "\r\n" in text else "\n"
     if args_line is not None:
         args_line = _value_line(section, "args", server.get("args"))
         assert args_line is not None
         if new[1:]:
             section = _replace_line(section, args_line, "args", args)
-        else:  # unwrapping a server that never had args
-            section = section[: args_line.start()] + section[args_line.end() + 1 :]
+        else:  # unwrapping a server that never had args: drop the line
+            after = args_line.end() + len(newline)
+            section = section[: args_line.start()] + section[after:]
     elif new[1:]:
         line = _value_line(section, "command", new[0])
         assert line is not None
-        section = section[: line.end()] + f"\nargs = {args}" + section[line.end() :]
+        insert = f"{newline}args = {args}"
+        section = section[: line.end()] + insert + section[line.end() :]
     return result("changed", new), (start, end, section)
 
 
 def _value_line(section: str, key: str, expected: object) -> re.Match | None:
     """The single line assigning `key`, if it alone yields the parsed value."""
-    for match in re.finditer(rf"^{key}[ \t]*=.*$", section, re.M):
+    for match in re.finditer(rf"^{key}[ \t]*=[^\r\n]*", section, re.M):
         try:
             if tomllib.loads(match.group(0)).get(key) == expected:
                 return match
