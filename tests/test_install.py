@@ -261,6 +261,18 @@ class FindExecutableTests(unittest.TestCase):
                 find_executable({"PATH": str(root / ".cache/uv/archive-v0/abc/bin")})
             )
 
+    def test_uvx_copies_are_skipped_wherever_the_uv_cache_lives(self):
+        # UV_CACHE_DIR or XDG_CACHE_HOME can move the cache to a path without
+        # ".cache"; uvx still runs from <cache>/archive-v0/, which gets pruned.
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "uv-cache/archive-v0/abc/bin"
+            bin_dir.mkdir(parents=True)
+            exe = bin_dir / "mcp-stdio-mux"
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+
+            self.assertIsNone(find_executable({"PATH": str(bin_dir)}))
+
     def test_relative_path_entries_never_supply_the_executable(self):
         with tempfile.TemporaryDirectory() as directory:
             exe = Path(directory) / "mcp-stdio-mux"
