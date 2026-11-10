@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -26,8 +27,10 @@ from tests.helpers import (
     TOOLS,
     initialize_params,
     isolated_environment,
+    notification,
     pid_alive,
     read_message,
+    read_reply,
     request,
     response,
     send_message,
@@ -157,7 +160,9 @@ class ScopeOverrideTests(unittest.TestCase):
                 load_config({"XDG_CONFIG_HOME": config_home})
 
 
-class SharedRuntimeIntegrationTests(unittest.TestCase):
+class IntegrationCase(unittest.TestCase):
+    """Real shims, daemons and a fixture backend in a private runtime dir."""
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(directory.cleanup)
@@ -181,7 +186,11 @@ class SharedRuntimeIntegrationTests(unittest.TestCase):
     def initialize(self, process):
         send_message(process, request(1, "initialize", initialize_params({})))
         self.assertEqual(read_message(process)["id"], 1)
+        # Like a real client: the handshake ends with this notification.
+        send_message(process, notification("notifications/initialized"))
 
+
+class SharedRuntimeIntegrationTests(IntegrationCase):
     def test_two_shims_share_one_backend_and_idle_shutdown_removes_socket(self):
         first = self.shim()
         self.initialize(first)
@@ -334,6 +343,160 @@ class SharedRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(metadata["domain"], "default")
         self.assertEqual(metadata["clients"], 1)
         self.assertTrue(pid_alive(metadata["backend_pid"]))
+
+
+class DaemonResilienceTests(IntegrationCase):
+    """Failures in one session or one message must not reach the others."""
+
+    def test_oversized_backend_line_is_dropped_and_the_session_keeps_working(self):
+        shim = self.shim()
+        self.initialize(shim)
+        send_message(shim, request(2, "huge"))
+        send_message(shim, request(3, "tools/list"))
+
+        self.assertEqual(read_reply(shim, 3, 20)["result"], {"tools": TOOLS})
+
+    def test_malformed_backend_messages_do_not_freeze_the_session(self):
+        shim = self.shim()
+        self.initialize(shim)
+        send_message(shim, request(2, "bad-id"))
+
+        self.assertEqual(read_reply(shim, 2)["result"], {"ok": True})
+        send_message(shim, request(3, "tools/list"))
+        self.assertEqual(read_reply(shim, 3)["result"], {"tools": TOOLS})
+
+    def test_a_session_that_stops_reading_does_not_stall_the_others(self):
+        stalled = self.shim()
+        self.initialize(stalled)
+        healthy = self.shim()
+        self.initialize(healthy)
+
+        send_message(stalled, request(2, "flood"))  # 12 MiB it never reads
+        send_message(healthy, request(2, "tools/list"))
+
+        self.assertEqual(read_reply(healthy, 2, 15)["result"], {"tools": TOOLS})
+
+    def test_server_without_tools_does_not_make_later_sessions_wait(self):
+        first = self.shim(None, "no-tools")
+        self.initialize(first)
+        second = self.shim(None, "no-tools")
+
+        started = time.monotonic()
+        self.initialize(second)
+
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_daemon_classifies_a_server_when_no_session_lists_tools(self):
+        first = self.shim()
+        self.initialize(first)
+        send_message(first, notification("notifications/initialized"))
+        second = self.shim()
+
+        started = time.monotonic()
+        self.initialize(second)
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(
+            [path.read_text() for path in self.runtime_root.glob("*.scope")],
+            ["shared\n"],
+        )
+
+    def test_relative_script_runs_in_the_session_directory(self):
+        (self.root / ".git").mkdir()
+        project = self.root / "project"
+        project.mkdir()
+        (project / "server.py").write_text(FIXTURE_BACKEND)
+        process = subprocess.Popen(
+            shim_command((sys.executable, "server.py", str(self.counter))),
+            cwd=project,
+            env=self.environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(stop_process, process)
+        self.initialize(process)
+
+        send_message(process, request(2, "cwd"))
+
+        self.assertEqual(
+            read_reply(process, 2)["result"]["cwd"], str(project.resolve())
+        )
+
+    def test_stdin_from_a_regular_file_is_refused_clearly(self):
+        source = self.root / "input.jsonl"
+        source.write_text("")
+        with source.open() as stdin:
+            result = subprocess.run(
+                shim_command(self.command()),
+                cwd=self.root,
+                env=self.environment,
+                stdin=stdin,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pipe", result.stderr)
+
+    def test_unusable_socket_path_fails_fast_without_starting_a_backend(self):
+        environment = {
+            **self.environment,
+            "MCP_STDIO_MUX_RUNTIME_DIR": str(self.root / ("r" * 120)),
+        }
+        started = time.monotonic()
+        result = subprocess.run(
+            shim_command(self.command()),
+            cwd=self.root,
+            env=environment,
+            stdin=subprocess.PIPE,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("too long", result.stderr)
+        self.assertFalse(self.counter.exists())
+
+    def test_per_session_daemons_leave_no_files_behind(self):
+        first = self.shim(None, "stateful")
+        self.initialize(first)
+        send_message(first, request(2, "tools/list"))
+        read_reply(first, 2)
+        second = self.shim(None, "stateful")
+        self.initialize(second)
+
+        stop_process(first)
+        stop_process(second)
+        # Per-session daemons exit five seconds after their session; only the
+        # first daemon's lock, keyed by the shared signature, stays.
+        wait_until(
+            lambda: (
+                not list(self.runtime_root.glob("*.sock"))
+                and len(list(self.runtime_root.glob("*.lock"))) == 1
+                and not list(self.runtime_root.glob("*.json"))
+            ),
+            timeout_seconds=12,
+        )
+
+    def test_daemon_command_line_does_not_carry_the_signature(self):
+        shim = self.shim()
+        self.initialize(shim)
+        wait_until(lambda: list(self.runtime_root.glob("*.json")), timeout_seconds=3)
+        metadata = json.loads(next(self.runtime_root.glob("*.json")).read_text())
+
+        arguments = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(metadata["pid"])],
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        self.assertIn("daemon", arguments)
+        self.assertNotIn(metadata["key"], arguments)
 
 
 if __name__ == "__main__":

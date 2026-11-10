@@ -200,6 +200,35 @@ class MessageRouterTests(unittest.TestCase):
             [("second", notification("notifications/message"))],
         )
 
+    def test_reply_for_a_session_that_left_is_dropped_not_broadcast(self):
+        # A late tool result must never reach a different session.
+        self.router.add_client("other")
+        call = self.router.route_client("gone", request(4, "tools/call"))
+        self.router.remove_client("gone")
+
+        self.assertEqual(
+            self.router.route_backend(response(call[0][1]["id"], {"secret": 1})), []
+        )
+
+    def test_response_with_an_unknown_or_unhashable_id_is_dropped(self):
+        self.router.add_client("first")
+
+        self.assertEqual(self.router.route_backend(response("c:999", {})), [])
+        self.assertEqual(self.router.route_backend(response([1], {})), [])
+
+    def test_leaving_session_answers_its_pending_server_requests(self):
+        initialize = request(1, "initialize", initialize_params({"roots": {}}))
+        backend_id = self.router.route_client("rooted", initialize)[0][1]["id"]
+        self.router.route_backend(response(backend_id, initialize_result()))
+        self.router.route_backend(request(8, "roots/list"))
+
+        deliveries = self.router.remove_client("rooted")
+
+        self.assertEqual(len(deliveries), 1)
+        destination, message = deliveries[0]
+        self.assertEqual((destination, message["id"]), ("backend", 8))
+        self.assertIn("error", message)
+
 
 class MessageParsingTests(unittest.TestCase):
     def test_parse_message_rejects_non_object_json(self):

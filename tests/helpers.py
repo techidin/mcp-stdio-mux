@@ -2,9 +2,10 @@
 
 import json
 import os
-import selectors
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -90,17 +91,35 @@ def send_message(process, message):
 
 
 def read_message(process, timeout_seconds=5):
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    if not selector.select(timeout_seconds):
+    # A reader thread, not select(): select() on the fd cannot see lines that
+    # readline() already pulled into Python's buffer, so two replies arriving
+    # together would hide the second one.
+    try:
+        line = _lines(process).get(timeout=timeout_seconds)
+    except queue.Empty:
         stderr = process.stderr.read() if process.poll() is not None else ""
-        raise AssertionError(f"timed out waiting for MCP response: {stderr}")
-    line = process.stdout.readline()
-    if not line:
+        raise AssertionError(f"timed out waiting for MCP response: {stderr}") from None
+    if line is None:
         raise AssertionError(
             f"MCP shim closed before responding: {process.stderr.read()}"
         )
     return json.loads(line)
+
+
+def _lines(process):
+    if not hasattr(process, "lines"):
+        process.lines = queue.Queue()
+
+        def pump():
+            try:
+                for line in process.stdout:
+                    process.lines.put(line)
+            except (OSError, ValueError):
+                pass  # the test closed the stream
+            process.lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+    return process.lines
 
 
 def stop_process(process):
@@ -172,20 +191,50 @@ if mode == "stateful":
 if mode == "large":
     tools[0]["description"] = "x" * 200_000
 
+def emit(message):
+    print(json.dumps(message), flush=True)
+
+
 for line in sys.stdin:
     message = json.loads(line)
-    if message.get("method") == "initialize":
+    method = message.get("method")
+    if method == "initialize":
         result = {
             "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
+            "capabilities": {} if mode == "no-tools" else {"tools": {}},
             "serverInfo": {"name": "fixture", "version": "1"},
         }
-    elif message.get("method") == "tools/list":
+    elif method == "tools/list":
+        with counter_path.with_suffix(".lists").open("a") as lists:
+            lists.write("list\\n")
         result = {"tools": tools}
-    elif message.get("method") == "cwd":
+    elif method == "cwd":
         result = {"cwd": os.getcwd()}
+    elif method == "huge":
+        # One line over the 16 MiB limit, then nothing for this request.
+        emit({"jsonrpc": "2.0", "id": message["id"], "result": "x" * (17 << 20)})
+        continue
+    elif method == "bad-id":
+        emit({"jsonrpc": "2.0", "id": [1], "result": {}})
+        emit({"jsonrpc": "2.0", "result": {}})
+        emit({"jsonrpc": "2.0", "id": {"a": 1}, "method": "ping"})
+        result = {"ok": True}
+    elif method == "flood":
+        log = {"jsonrpc": "2.0", "method": "notifications/message"}
+        for _ in range(12):
+            emit({**log, "params": {"level": "info", "data": "y" * (1 << 20)}})
+        result = {"ok": True}
     else:
         continue
-    reply = {"jsonrpc": "2.0", "id": message["id"], "result": result}
-    print(json.dumps(reply), flush=True)
+    emit({"jsonrpc": "2.0", "id": message["id"], "result": result})
 """
+
+
+def read_reply(process, message_id, timeout_seconds=10):
+    """The response to `message_id`, skipping notifications broadcast meanwhile."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        message = read_message(process, max(deadline - time.monotonic(), 0.1))
+        if message.get("id") == message_id and "method" not in message:
+            return message
+    raise AssertionError(f"no reply to request {message_id}")

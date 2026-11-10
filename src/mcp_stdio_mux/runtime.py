@@ -15,6 +15,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -32,8 +33,16 @@ CLASSIFY_WAIT_SECONDS = 20.0
 START_TIMEOUT_SECONDS = 10.0
 HANDOFF_TIMEOUT_SECONDS = 5.0
 RUN_SCOPES = ("auto", "global", "workspace", "session")
-RELAY = "/bin/cat"
+RELAY = "/bin/cat" if os.path.exists("/bin/cat") else "cat"  # NixOS has no /bin/cat
 RELAY_PREFIX = "mcp-stdio-mux: "
+# The daemon learns its identity from the environment, not argv: `ps` is world
+# readable and the key is derived from (hashed) credentials.
+KEY_ENV = "MCP_STDIO_MUX_DAEMON_KEY"
+LEARN_ENV = "MCP_STDIO_MUX_DAEMON_LEARN"
+SOCKET_PATH_LIMIT = 103  # macOS sun_path is 104 bytes including the NUL
+SCRIPT_SUFFIXES = (".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".sh", ".jar")
+PROJECT_RUNNERS = frozenset({"uv", "npm", "pnpm", "yarn", "bun"})
+CONTAINER_TOOLS = frozenset({"docker", "podman", "nerdctl"})
 # Tool-name words that imply per-client state (an open browser, a selected tab,
 # a login). One match makes the backend per-session instead of shared.
 STATEFUL_TOOL_WORDS = frozenset(
@@ -73,15 +82,29 @@ class Launch(NamedTuple):
 def run(argv: Sequence[str]) -> int:
     parent = os.getppid()
     arguments = parse_run_args(argv)
-    if parent == 1:
-        return 0  # the session died before we started; nobody would read us
+    _require_stdio_pipes()
     prepare_runtime_root()
     for _ in range(3):
         launch = resolve_launch(arguments)
         paths = runtime_paths(launch.key)
+        if len(os.fsencode(paths.socket)) > SOCKET_PATH_LIMIT:
+            raise RuntimeError(
+                f"socket path too long ({paths.socket}); "
+                "set MCP_STDIO_MUX_RUNTIME_DIR to a shorter directory"
+            )
         if ensure_daemon(paths, launch, daemon_arguments(arguments, launch)):
             hand_over(paths, arguments.server, parent)  # returns only on refusal
     raise RuntimeError(f"could not attach to a backend; inspect {paths.log}")
+
+
+def _require_stdio_pipes() -> None:
+    for descriptor, name in ((0, "stdin"), (1, "stdout")):
+        mode = os.fstat(descriptor).st_mode
+        if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)):
+            raise RuntimeError(
+                f"{name} must be a pipe or socket: `mcp-stdio-mux run` is started "
+                "by an MCP client, not with a file redirect"
+            )
 
 
 def parse_run_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -128,17 +151,22 @@ def resolve_launch(
         learn = signature if learned is None else None
         if learned == "session":
             scope = "session"
-        elif arguments.workspace or is_cwd_bound(arguments.command):
+        elif (
+            arguments.workspace
+            or is_cwd_bound(arguments.command)
+            or uses_relative_paths(arguments.command)
+        ):
             scope = "workspace"
         else:
             scope = "global"
     if scope == "global":
         return Launch(scope, signature, home or Path.home(), learn)
-    workspace = (
-        arguments.workspace.resolve()
-        if arguments.workspace
-        else canonical_workspace(Path.cwd())
-    )
+    if arguments.workspace:
+        workspace = arguments.workspace.resolve()
+    elif uses_relative_paths(arguments.command):
+        workspace = Path.cwd().resolve()  # relative paths need the exact directory
+    else:
+        workspace = canonical_workspace(Path.cwd())
     if scope == "workspace":
         key = runtime_key(arguments.domain, arguments.command, fingerprint, workspace)
         return Launch(scope, key, workspace, learn)
@@ -181,6 +209,24 @@ def is_cwd_bound(command: Sequence[str]) -> bool:
             flag = argument.split("=", 1)[0].lower()
             if any(word in flag for word in CWD_FLAG_WORDS):
                 return True
+    return False
+
+
+def uses_relative_paths(command: Sequence[str]) -> bool:
+    """True when the command only works from the directory it was started in."""
+    executable = command[0]
+    if "/" in executable and not executable.startswith(("/", "~")):
+        return True
+    if Path(executable).name in CONTAINER_TOOLS:
+        return False  # `ghcr.io/org/image` is an image name, not a path
+    arguments = command[1:]
+    if Path(executable).name in PROJECT_RUNNERS and "run" in arguments[:2]:
+        return True  # `npm run dev`, `uv run server`: the project is the cwd
+    for argument in arguments:
+        if argument.startswith(("-", "/", "~", "@")) or ":" in argument:
+            continue  # flags, absolute paths, npm scopes, URLs and specs
+        if "/" in argument or argument.endswith(SCRIPT_SUFFIXES):
+            return True
     return False
 
 
@@ -263,8 +309,6 @@ def prepare_runtime_root() -> Path:
 def daemon_arguments(arguments: argparse.Namespace, launch: Launch) -> list:
     idle = SESSION_IDLE_SECONDS if launch.scope == "session" else arguments.idle_seconds
     return [
-        "--key",
-        launch.key,
         "--domain",
         arguments.domain,
         "--server",
@@ -275,7 +319,6 @@ def daemon_arguments(arguments: argparse.Namespace, launch: Launch) -> list:
         str(launch.workspace),
         "--idle-seconds",
         str(idle),
-        *(["--learn", launch.learn] if launch.learn else []),
         "--",
         *arguments.command,
     ]
@@ -293,12 +336,16 @@ def ensure_daemon(
         if paths.socket.exists():
             paths.socket.unlink()
         log = os.open(paths.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        environment = {**os.environ, KEY_ENV: launch.key}
+        if launch.learn:
+            environment[LEARN_ENV] = launch.learn
         try:
             # -P keeps the backend's directory off sys.path: a workspace must not
             # be able to shadow this package.
-            subprocess.Popen(
+            daemon = subprocess.Popen(
                 [sys.executable, "-P", "-m", "mcp_stdio_mux", "daemon", *arguments],
                 cwd=str(launch.workspace),
+                env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
@@ -311,6 +358,8 @@ def ensure_daemon(
         while time.monotonic() < deadline:
             if _socket_is_live(paths.socket):
                 return True
+            if daemon.poll() is not None:
+                break  # it died; waiting longer cannot help
             time.sleep(0.05)
         raise RuntimeError(f"daemon did not start; inspect {paths.log}")
     finally:

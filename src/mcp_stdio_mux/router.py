@@ -38,13 +38,33 @@ class MessageRouter:
         self._initialized_sent = False
         self._sequence = 0
 
+    @property
+    def initialize_result(self) -> object | None:
+        """The backend's first `initialize` result, once it has answered."""
+        return self._initialize_result
+
     def add_client(
         self, client_id: str, capabilities: Mapping[str, object] | None = None
     ) -> None:
         self._clients[client_id] = capabilities or {}
 
-    def remove_client(self, client_id: str) -> None:
+    def remove_client(self, client_id: str) -> list[Delivery]:
+        """Forget a session; answer the server requests it will never answer."""
         self._clients.pop(client_id, None)
+        orphaned = [
+            proxy_id
+            for proxy_id, owner in self._server_requests.items()
+            if owner[0] == client_id
+        ]
+        answers: list[Delivery] = [
+            (
+                "backend",
+                error_response(
+                    self._server_requests.pop(proxy_id)[1], "Client disconnected"
+                ),
+            )
+            for proxy_id in orphaned
+        ]
         self._backend_requests = {
             proxy_id: owner
             for proxy_id, owner in self._backend_requests.items()
@@ -58,6 +78,7 @@ class MessageRouter:
         self._waiting_initializers = [
             waiting for waiting in self._waiting_initializers if waiting[0] != client_id
         ]
+        return answers
 
     def fail_backend(self, error_message: str) -> list[Delivery]:
         deliveries = []
@@ -106,9 +127,11 @@ class MessageRouter:
         method = routed.get("method")
         message_id = routed.get("id")
 
-        if method is None and message_id == self._initialize_request_id:
+        # Our proxy ids are strings; anything else cannot be a reply we sent for.
+        known = isinstance(message_id, str)
+        if method is None and known and message_id == self._initialize_request_id:
             return self._complete_initialize(routed)
-        if method is None and message_id in self._backend_requests:
+        if method is None and known and message_id in self._backend_requests:
             proxy_id = str(message_id)
             client_id, client_message_id = self._backend_requests.pop(proxy_id)
             self._client_progress = {
@@ -123,6 +146,8 @@ class MessageRouter:
         if method == "notifications/progress":
             progress = self._restore_progress_token(routed)
             return [progress] if progress else []
+        if method is None:
+            return []  # a reply for a session that left, or for nobody
         return [(client_id, copy.deepcopy(routed)) for client_id in self._clients]
 
     def _route_initialize(self, client_id: str, message: JsonObject) -> list[Delivery]:
