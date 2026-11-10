@@ -27,14 +27,14 @@ to "share my MCP servers" or "share the server I just added".
 ## Measured
 
 Four sessions of one server, every process the sessions caused (relays, daemon,
-backend and its children), macOS 27.2 on Apple silicon with 16 GB, two runs on
+backend and its children), macOS 27.2 on Apple silicon with 16 GB, three runs on
 10 November 2026. The unit is `phys_footprint`, the "Memory" column of Activity
 Monitor.
 
 | Server | Without a mux | With mcp-stdio-mux | Saved |
 |---|---|---|---|
-| serena (Python) | 679–710 MB | 202–203 MB | about 71% |
-| tilth (Node) | 57 MB | 36 MB | about 37% |
+| serena (Python) | 679–757 MB | 202–203 MB | 70–73% |
+| tilth (Node) | 57 MB | 36 MB | 37% |
 
 Each session's own process drops from 12–94 MB to 1.2 MB. The saving grows with
 the number of sessions and with how heavy the server is. Reproduce it with any
