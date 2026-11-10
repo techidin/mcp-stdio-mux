@@ -269,16 +269,19 @@ class SharedRuntimeIntegrationTests(unittest.TestCase):
         shim = self.shim()
         self.initialize(shim)
 
-        rss_kb, args = subprocess.run(
-            ["ps", "-o", "rss=,args=", "-p", str(shim.pid)],
-            capture_output=True,
-            text=True,
-        ).stdout.split(maxsplit=1)
+        def process():
+            return subprocess.run(
+                ["ps", "-o", "rss=,args=", "-p", str(shim.pid)],
+                capture_output=True,
+                text=True,
+            ).stdout.split(maxsplit=1)
 
+        # The daemon reads the session's stdin itself, so it can answer before
+        # the shim has finished exec'ing; wait for the exec, not the reply.
+        wait_until(lambda: process()[1].strip() == "mcp-stdio-mux: fixture", 5)
         # Only the exec'd relay carries this argv[0], and no Python interpreter
         # fits in 6 MB: the shim is gone, its pid lives on as `cat`.
-        self.assertEqual(args.strip(), "mcp-stdio-mux: fixture")
-        self.assertLess(int(rss_kb), 6 * 1024)
+        self.assertLess(int(process()[0]), 6 * 1024)
 
     def test_killed_shim_releases_its_backend(self):
         shim = self.shim()
