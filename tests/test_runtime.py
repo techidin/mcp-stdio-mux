@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -166,12 +167,33 @@ class IntegrationCase(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(directory.cleanup)
+        # Cleanups run last-in first-out: this one runs after every shim has
+        # stopped and before the directory goes. A daemon outlives its last
+        # shim by its idle timeout and still writes here; removing the
+        # directory under it failed CI once (run 42788118680).
+        self.addCleanup(self.stop_daemons)
         self.root = Path(directory.name)
         self.runtime_root = self.root / "runtime"
         self.counter = self.root / "starts.txt"
         self.backend = self.root / "fixture_backend.py"
         self.backend.write_text(FIXTURE_BACKEND)
         self.environment = isolated_environment(self.root)
+
+    def stop_daemons(self):
+        """Stop this test's daemons and wait until they have cleaned up."""
+        for meta in self.runtime_root.glob("*.json"):
+            try:
+                pid = int(json.loads(meta.read_text())["pid"])
+            except (OSError, ValueError, KeyError):
+                continue  # the daemon removed it while we looked
+            arguments = subprocess.run(
+                ["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True
+            ).stdout
+            if "mcp_stdio_mux daemon" in arguments:  # ours, not a reused pid
+                os.kill(pid, signal.SIGTERM)
+        wait_until(
+            lambda: not list(self.runtime_root.glob("*.json*")), timeout_seconds=10
+        )
 
     def command(self, *mode):
         return (sys.executable, str(self.backend), str(self.counter), *mode)
