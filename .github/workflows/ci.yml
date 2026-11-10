@@ -1,9 +1,10 @@
 name: ci
 
+# Every PR runs the tests once; main runs them again after each release merge.
 on:
   pull_request:
   push:
-    branches: [main, sandbox]
+    branches: [main]
 
 permissions:
   contents: read
