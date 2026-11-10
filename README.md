@@ -44,7 +44,15 @@ Monitor.
 | Server | Without a mux | With mcp-stdio-mux | Saved |
 |---|---|---|---|
 | serena (Python) | 679–757 MB | 202–203 MB | 70–73% |
+| context7 (Node, npx) | 426–452 MB | 128–160 MB | 62–72% |
+| GitHub MCP (Node, npx) | 272–293 MB | 90–113 MB | 58–69% |
 | tilth (Node) | 57 MB | 36 MB | 37% |
+
+context7 is `@upstash/context7-mcp` 4.6.0 and GitHub MCP is
+`@modelcontextprotocol/server-github` 0.6.2, both started with `npx` and
+measured with mcp-stdio-mux 0.1.2. An `npx` session is two processes, `npm exec`
+and `node`, so four sessions run eight without the mux and seven with it: four
+relays, the daemon and one `npm exec` with its `node`.
 
 Each session's own process drops from 12–94 MB to 1.2 MB. The saving grows with
 the number of sessions and with how heavy the server is. Reproduce it with any
