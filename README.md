@@ -1,5 +1,9 @@
 # mcp-stdio-mux
 
+[![PyPI](https://img.shields.io/pypi/v/mcp-stdio-mux)](https://pypi.org/project/mcp-stdio-mux/)
+[![CI](https://github.com/techidin/mcp-stdio-mux/actions/workflows/ci.yml/badge.svg)](https://github.com/techidin/mcp-stdio-mux/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 One shared process per MCP server across every AI agent session, app and
 profile on your machine.
 
@@ -7,6 +11,12 @@ Open four Claude Code sessions and each one starts its own copy of every stdio
 MCP server you configured. Add Codex, Cursor, or a second profile and the copies
 multiply. `mcp-stdio-mux` puts one shared backend behind all of them; each
 session reaches it through a 1.2 MB relay instead of a server of its own.
+[Why I built it](https://ahmadmuhyidin.my.id/blog/share-one-mcp-server-across-agent-sessions).
+
+It handles any server an app starts as a local command: `npx` packages such as
+the GitHub, Postman, Cloudflare, Google Drive and Playwright servers,
+`uvx mcp-server-fetch`, `mcp-remote` bridges to hosted servers, `uv run`
+projects, and plain binaries such as serena and tilth.
 
 ## Install
 

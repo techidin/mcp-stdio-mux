@@ -18,6 +18,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: The tag names the version being released
+        # A tag pushed before the release PR merged would rebuild the old version.
+        run: |
+          version=$(PYTHONPATH=src python -c "import mcp_stdio_mux; print(mcp_stdio_mux.__version__)")
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package version $version"
+            exit 1
+          fi
       - run: python -m pip install --upgrade build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
